@@ -1,0 +1,2 @@
+This folder contains eight excel files corresponding to four lists with respectively two variations of button positions (left-251/right-252). 
+The lists contain all information about the sequences and trials, the visual stimuli and the audio recordings used and the attention questions and correct answers. They also contain the information about the movements that the stimuli execute and their new positions. 
