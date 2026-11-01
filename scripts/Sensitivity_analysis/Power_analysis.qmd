@@ -1,0 +1,722 @@
+---
+title: "Power Analysis - Master's thesis: Listeners' sensitivity to gender informativity: an EEG study (Faux package)"
+author: "Santina S. Kemper"
+date: "29-08-2026"
+output: html_document
+---
+# Power Analysis 
+This note book will be used to perform a power/sensitivity analysis for my Master's thesis in Linguistics called "Listeners' sensitivity to gender informativity: an EEG study".
+
+## Design 
+The experiment design encompasses 24 target items which will be seen twice by each participant two gender contexts, so that each participant will contribute 96 data points. The experiment is devided into 4 couterbalanced lists using a Latin square design to account for the connected appearance of modification and mention. Items can be modified or unmodified at each occurrence, resulting in four distinct modification pattens (A-D). Each list is then tested twice with yes-no-buttons left or right. The initial idea is to test 48 participants, equalling 12 participant in each list and 6 per list version (left/right). 
+
+### Packages
+```{r}
+#| output: false
+library(lme4)
+library(simr)
+library(readxl)
+library(tibble)
+library(dplyr)
+library(tidyverse)
+library(lmerTest)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(purrr)
+library(broom.mixed)
+library(faux)
+```
+
+### Build design  
+```{r}
+build_design <- function(n_items = 24, n_subj = 48, colours = c("red", "blue", "green", "pink", "purple", "orange", "turquoise", "yellow")) {
+  
+  stopifnot(n_items %% 4 == 0, n_subj %% 4 == 0, n_items %% 3 == 0,length(colours) == 8 ) # used to assign conditions ABCD to each participant and item
+
+  conditions <- c("A", "B", "C", "D")
+
+  mod_lookup <- tibble(
+    condition = conditions,
+    mod_m1 = c("unmod", "unmod", "mod", "mod"),
+    mod_m2 = c("unmod", "mod", "mod", "unmod")
+  ) # to assign the modified to the conditions
+
+  item_rotation <- tibble(item = factor(1:n_items)) %>%
+    mutate(base_cond = (as.integer(item) - 1) %% 4) # latin square
+
+  item_condition <- crossing(item_rotation, list = 1:4) %>%
+    mutate(cond_idx = (base_cond + list - 1) %% 4 + 1,
+           condition = conditions[cond_idx]) %>%
+    select(item, list, condition) # latin square assignment
+
+  subjects <- tibble(subj = factor(1:n_subj)) %>%
+    mutate(list = rep(1:4, length.out = n_subj))
+
+  gender_lookup <- tibble(
+    item = factor(1:n_items),
+    gender = c("der", "die", "das")[((1:n_items - 1)%%3)+1]
+  )
+  
+  colour_lookup <- crossing(item = factor(1:n_items), condition = conditions) %>%
+    arrange(item, condition) %>%
+    group_by(item) %>%
+    mutate(start= (as.integer(item)-1) %% length(colours),
+           pos= row_number() - 1,
+           colour_idx = (start + pos) %% length(colours) + 1,
+           adjective = colours[colour_idx]) %>%
+    ungroup() %>%
+    select(item, condition, adjective)
+    
+  trials <- crossing(subj = subjects$subj,
+                      item = factor(1:n_items),
+                      mention = as.factor(c("m1", "m2")),
+                      informative = as.factor(c("inf", "uninf"))) %>%
+    left_join(subjects, by = "subj") %>%
+    left_join(item_condition, by = c("item", "list")) %>%
+    left_join(mod_lookup, by = "condition") %>%
+    mutate(modified = if_else(mention == "m1", mod_m1, mod_m2)) %>% # to make modified schema fit the two mentions
+    left_join(gender_lookup, by = "item") %>%
+    left_join(colour_lookup, by = c("item", "condition"))%>%
+    mutate(adjective = if_else(modified == "mod", adjective, "0")) %>%
+    select(subj, item, list, condition, mention, informative, modified, gender, adjective) %>%
+    mutate(
+    modified_effect     = if_else(modified == "unmod", 0.5, -0.5),
+    informative_effect  = if_else(informative == "uninf", 0.5, -0.5),
+    mention_effect      = if_else(mention == "m2", 0.5, -0.5)
+  )
+
+  trials
+}
+
+data0 <- build_design(n_items = 24, n_subj = 48)
+
+```
+
+## Add random effects 
+Random effects were added based on pilot data (n=3). The random effects are based on the SDs of the model output (N400 ~ modified * informative * mention + (1 +informative| subject) + (1 +informative | item). The correlations were chosen to be +/-0.5 as the model output could not have generated meaningful values due to a small data set. 
+```{r}
+data_nounN400 <- data0 %>%
+  add_ranef("item", u0i = 1.5, u_info_i = 0.8, .cors = 0.5) %>%
+  add_ranef("subj", u0s = 1.6, u_info_s = 0.08, .cors = -0.5) %>%
+  add_ranef(sigma = 7.6)
+head(data_nounN400)
+```
+
+# Noun: N400
+```{r}
+data_nounN400_2 <- data_nounN400 %>%
+  mutate(
+    N400 = 0.3 +
+      -1.6 * modified_effect +
+       0.4 * informative_effect+
+      -0.8 * mention_effect +
+      -1.1 * modified_effect * informative_effect +
+      -2.7 * modified_effect * mention_effect +
+       1.06 * informative_effect * mention_effect +
+       -1.87 * modified_effect * informative_effect * mention_effect +
+      u0s + u0i + sigma
+  )
+head(data_nounN400_2)
+```
+
+## Simulate N400 using the logic from above
+```{r}
+simulate_n400 <- function(rep = NULL, subj_n, item_n,
+                           b_mod, b_inf, b_ment,
+                           b_mod_inf, b_mod_ment,
+                           b_inf_ment, b_mod_inf_ment,
+                           u0i = 1.5, u_info_i = 0.8,
+                           u0s = 1.6, u_info_s = 0.08,
+                           r01i = 0.5, sigma_val = 7.6, ...) {
+
+  dat <- build_design(n_items = item_n, n_subj = subj_n) %>%
+    mutate(
+      modified_effect     = if_else(modified == "unmod", -0.5, 0.5),
+      informative_effect  = if_else(informative == "uninf", -0.5, 0.5),
+      mention_effect       = if_else(mention == "m2", -0.5, 0.5)
+    ) %>%
+    add_ranef("item", u0i = u0i ) %>% # u_info_i = u_info_i, .cors = r01i
+    add_ranef("subj", u0s = u0s) %>% #  u_info_s = u_info_s, .cors = r01i
+    add_ranef(sigma = sigma_val) %>%
+    mutate(
+      N400 = 0.3 +
+        b_mod * modified_effect +
+        b_inf * informative_effect +
+      #  (b_inf + u_info_s + u_info_i) * informative_effect +
+        b_ment  * mention_effect +
+        b_mod_inf      * modified_effect    * informative_effect +
+        b_mod_ment     * modified_effect    * mention_effect +
+        b_inf_ment     * informative_effect * mention_effect +
+        b_mod_inf_ment * modified_effect * informative_effect * mention_effect +
+        u0s + u0i + sigma
+    )
+
+  mod <- lmer(N400 ~ modified_effect * informative_effect * mention_effect +
+                (1  | subj) +
+                (1  | item),
+              data = dat)
+
+  broom.mixed::tidy(mod)
+}
+
+```
+
+## create multiple repetitions with this set
+```{r}
+#|echo: false
+n_reps <- 200
+
+sim_results <- map_dfr(1:n_reps, function(i) {
+  simulate_n400(subj_n = 48, item_n = 24,
+                           b_mod = -1.6, b_inf = 0.44, b_ment = -0.8,
+                           b_mod_inf = -1.1, b_mod_ment = -2.7,
+                           b_inf_ment = 1.06 , b_mod_inf_ment = 1.87)
+}, .id = "rep")
+
+power_table <- sim_results %>%
+  filter(effect == "fixed") %>%
+  group_by(term) %>%
+  summarise(
+    power       = mean(p.value < .05),
+    n_converged = n_distinct(rep),
+    mean_est    = mean(estimate),
+    .groups = "drop"
+  )
+
+power_table
+```
+This suggests that if we expect the same values as observed in the data set of 3 participants, we only achieve power above 0.8 of mention, modification, and their interaction. Informativity only reaches a power of 0.475 while the three way interaction reaches power of 0.615. 
+
+## Based on the pilot data check power for different set sizes and expected effect sizes 
+We always manipulate one effect keeping the other values constant.
+```{r}
+#| echo: false
+n_reps <- 20 # originally ran them with more repetitions but that takes ages when trying to render
+
+sweep_mod <- crossing(
+  rep = 1:n_reps, subj_n = c(48, 56, 64, 72), item_n = 24,
+  b_mod = c(-1.0, -1.3, -1.6, -1.9, -2.2), r01i = 0.5,  # we make 0.3 steps in both directions
+  b_inf = 0.44,
+  b_ment = -0.77,
+  b_mod_inf = -1.1, 
+  b_mod_ment = -2.7,
+  b_inf_ment = 1.06,
+  b_mod_inf_ment = 1.87
+) %>%
+  mutate(analysis = pmap(., simulate_n400)) %>%
+  unnest(analysis)
+
+sweep_inf <- crossing(
+  rep = 1:n_reps, subj_n = c(48, 56, 64, 72), item_n = 24,
+  b_inf = c(0.38, 0.41, 0.44, 0.47, 0.5), r01i = 0.5, 
+  b_mod = -1.6,
+  b_ment = -0.77,
+  b_mod_inf = -1.1,
+  b_mod_ment = -2.7,
+  b_inf_ment = 1.06,
+  b_mod_inf_ment = 1.87
+) %>%
+  mutate(analysis = pmap(., simulate_n400)) %>%
+  unnest(analysis)
+
+sweep_ment <- crossing(
+  rep = 1:n_reps, subj_n = c(48, 56, 64, 72), item_n = 24,
+  b_ment = c(-0.71, -0.74, -0.77, -0.8, -0.83), r01i = 0.5, 
+  b_mod = -1.6,
+  b_inf = 0.44,
+  b_mod_inf = -1.1,
+  b_mod_ment = -2.7,
+  b_inf_ment = 1.06,
+  b_mod_inf_ment = 1.87
+) %>%
+  mutate(analysis = pmap(., simulate_n400)) %>%
+  unnest(analysis)
+
+sweep_inf_ment <- crossing(
+  rep = 1:n_reps, subj_n = c(48, 56, 64, 72), item_n = 24,
+  b_inf_ment = c(0.44, 0.74, 1.06, 1.36, 1.66), r01i = 0.5, 
+  b_mod = -1.6,
+  b_inf = 0.44,
+  b_ment = -0.77,
+  b_mod_inf = -1.1, 
+  b_mod_ment = -2.7,
+  b_mod_inf_ment = 1.87
+) %>%
+  mutate(analysis = pmap(., simulate_n400)) %>%
+  unnest(analysis)
+
+sweep_mod_inf <- crossing(
+  rep = 1:n_reps, subj_n = c(48, 56, 64, 72), item_n = 24,
+  b_inf_ment = 1.06, r01i = 0.5, 
+  b_mod = -1.6,
+  b_inf = 0.44,
+  b_ment = -0.77,
+  b_mod_inf = c(-0.5,- 0.8, -1.1, -1.4, -1.7),
+  b_mod_ment = -2.7,
+  b_mod_inf_ment = 1.87
+) %>%
+  mutate(analysis = pmap(., simulate_n400)) %>%
+  unnest(analysis)
+
+sweep_mod_ment <- crossing(
+  rep = 1:n_reps, subj_n = c(48, 56, 64, 72), item_n = 24,
+  b_inf_ment = 1.06, r01i = 0.5, 
+  b_mod = -1.6,
+  b_inf = 0.44,
+  b_ment = -0.77,
+  b_mod_inf = -1.1,
+  b_mod_ment = c(-2.1, -2.4, -2.7, -3.0, -3.3),
+  b_mod_inf_ment = 1.87
+) %>%
+  mutate(analysis = pmap(., simulate_n400)) %>%
+  unnest(analysis)
+
+sweep_mod_inf_ment <- crossing(
+  rep = 1:n_reps, subj_n = c(48, 56, 64, 72), item_n = 24,
+  b_inf_ment = 1.06, r01i = -0.5, 
+  b_mod = -1.6,
+  b_inf = 0.44,
+  b_ment = -0.77,
+  b_mod_inf = -1.1,
+  b_mod_ment = -2.7,
+  b_mod_inf_ment = c(1.27, 1.57, 1.87, 2.17, 2.47)
+) %>%
+  mutate(analysis = pmap(., simulate_n400)) %>%
+  unnest(analysis)
+```
+
+
+```{r}
+filter(sweep_ment, effect == "fixed", term == "mention_effect") %>%
+  group_by(b_ment, subj_n) %>%
+  summarise(power = mean(p.value < .05), .groups = "drop") %>%
+  ggplot(aes(b_ment, subj_n, fill = power)) +
+  geom_tile() +
+  geom_text(aes(label = sprintf("%.2f", power)), color = "white", size = 10) +
+  scale_fill_distiller(palette ="Spectral",limits = c(0, 1), direction = 1)
+
+filter(sweep_inf, effect == "fixed", term == "informative_effect") %>%
+  group_by(b_inf, subj_n) %>%
+  summarise(power = mean(p.value < .05), .groups = "drop") %>%
+  ggplot(aes(b_inf, subj_n, fill = power)) +
+  geom_tile() + geom_text(aes(label = sprintf("%.2f", power)), color = "white", size = 10) +
+  scale_fill_distiller(palette ="Spectral",limits = c(0, 1), direction = 1)
+
+filter(sweep_mod, effect == "fixed", term == "modified_effect") %>%
+  group_by(b_mod, subj_n) %>%
+  summarise(power = mean(p.value < .05), .groups = "drop") %>%
+  ggplot(aes(b_mod, subj_n, fill = power)) +
+  geom_tile() + geom_text(aes(label = sprintf("%.2f", power)), color = "white", size = 10) +
+  scale_fill_distiller(palette ="Spectral",limits = c(0, 1), direction = 1)
+
+filter(sweep_inf_ment, effect == "fixed", term == "informative_effect:mention_effect") %>%
+  group_by(b_inf_ment, subj_n) %>%
+  summarise(power = mean(p.value < .05), .groups = "drop") %>%
+  ggplot(aes(b_inf_ment, subj_n, fill = power)) +
+  geom_tile() + geom_text(aes(label = sprintf("%.2f", power)), color = "white", size = 10) +
+  scale_fill_distiller(palette ="Spectral",limits = c(0, 1), direction = 1)
+
+filter(sweep_mod_inf, effect == "fixed", term == "modified_effect:informative_effect") %>%
+  group_by(b_mod_inf, subj_n) %>%
+  summarise(power = mean(p.value < .05), .groups = "drop") %>%
+  ggplot(aes(b_mod_inf, subj_n, fill = power)) +
+  geom_tile() + geom_text(aes(label = sprintf("%.2f", power)), color = "white", size = 10) +
+  scale_fill_distiller(palette ="Spectral",limits = c(0, 1), direction = 1)
+
+filter(sweep_mod_ment, effect == "fixed", term == "modified_effect:mention_effect") %>%
+  group_by(b_mod_ment, subj_n) %>%
+  summarise(power = mean(p.value < .05), .groups = "drop") %>%
+  ggplot(aes(b_mod_ment, subj_n, fill = power)) +
+  geom_tile() + geom_text(aes(label = sprintf("%.2f", power)), color = "white", size = 10) +
+  scale_fill_distiller(palette ="Spectral",limits = c(0, 1), direction = 1)
+
+filter(sweep_mod_inf_ment, effect == "fixed", term == "modified_effect:informative_effect:mention_effect") %>%
+  group_by(b_mod_inf_ment, subj_n) %>%
+  summarise(power = mean(p.value < .05), .groups = "drop") %>%
+  ggplot(aes(b_mod_inf_ment, subj_n, fill = power)) +
+  geom_tile() + geom_text(aes(label = sprintf("%.2f", power)), color = "white", size = 10) +
+  scale_fill_distiller(palette ="Spectral",limits = c(0, 1), direction = 1)
+```
+
+### more specific 
+Based on the results above, the effect sizes for mention and modification as observed in the pilot data seem to be sufficient to reach above 0.8 power. However, the effect size for informativity is too small to detect a possible effect reliably. The effect size needs to be above 0.5. While the effect size for the interaction between mention and modfification is sufficient, the interactions modification * informativity, mention * informativity only reach above 0.6 in power. The three-way interaction reaches 0.56 power and would have to have an effect size of 2.5 to reach 0.8 power with 48 participants. 
+
+```{r}
+#| echo: false
+n_reps <- 20 # re-run again with 100 (takes about half an hour maybe so yeah waiting is fun)
+
+sweep_inf <- crossing(
+  rep = 1:n_reps, subj_n = c(40, 48, 56, 64, 72, 80), item_n = 24,
+  b_inf = c(2.0, 1.5, 1.0, 0.5, 0, -0.5, -1.0, -1.5, -2.0), r01i = 0,
+  b_mod = 0,
+  b_ment = 0,
+  b_mod_inf = 0,
+  b_mod_ment = 0,
+  b_inf_ment = 0,
+  b_mod_inf_ment = 0
+) %>%
+  mutate(analysis = pmap(., simulate_n400)) %>%
+  unnest(analysis)
+
+sweep_inf_ment <- crossing(
+  rep = 1:n_reps, subj_n = c(40, 48, 56, 64, 72, 80), item_n = 24,
+  b_inf_ment = c(2.0, 1.5, 1.0, 0.5, 0, -0.5, -1.0, -1.5, -2.0), r01i = 0, 
+  b_mod = 0,
+  b_inf = 0,
+  b_ment = 0,
+  b_mod_inf = 0, 
+  b_mod_ment = 0,
+  b_mod_inf_ment = 0
+) %>%
+  mutate(analysis = pmap(., simulate_n400)) %>%
+  unnest(analysis)
+
+sweep_mod_inf <- crossing(
+  rep = 1:n_reps, subj_n = c(40, 48, 56, 64, 72, 80), item_n = 24,
+  b_inf_ment = 0, r01i = 0, 
+  b_mod = 0,
+  b_inf = 0,
+  b_ment = 0,
+  b_mod_inf = c(2.0, 1.5, 1.0, 0.5, 0, -0.5, -1.0, -1.5, -2.0),
+  b_mod_ment = 0,
+  b_mod_inf_ment = 0
+) %>%
+  mutate(analysis = pmap(., simulate_n400)) %>%
+  unnest(analysis)
+
+sweep_mod_inf_ment <- crossing(
+  rep = 1:n_reps, subj_n = c(40, 48, 56, 64, 72, 80), item_n = 24,
+  b_inf_ment = 0, r01i = 0, 
+  b_mod = 0,
+  b_inf = 0,
+  b_ment = 0,
+  b_mod_inf = 0,
+  b_mod_ment = 0,
+  b_mod_inf_ment = c(2.0, 1.5, 1.0, 0.5, 0, -0.5, -1.0, -1.5, -2.0)
+) %>%
+  mutate(analysis = pmap(., simulate_n400)) %>%
+  unnest(analysis)
+```
+
+```{r}
+
+filter(sweep_inf, effect == "fixed", term == "informative_effect") %>%
+  group_by(b_inf, subj_n) %>%
+  summarise(power = mean(p.value < .05), .groups = "drop") %>%
+  ggplot(aes(b_inf, subj_n, fill = power)) +
+  geom_tile() + geom_text(aes(label = sprintf("%.2f", power)), color = "white", size = 5) +
+  scale_fill_distiller(palette ="Spectral",limits = c(0, 1), direction = 1)
+
+filter(sweep_inf_ment, effect == "fixed", term == "informative_effect:mention_effect") %>%
+  group_by(b_inf_ment, subj_n) %>%
+  summarise(power = mean(p.value < .05), .groups = "drop") %>%
+  ggplot(aes(b_inf_ment, subj_n, fill = power)) +
+  geom_tile() + geom_text(aes(label = sprintf("%.2f", power)), color = "white", size = 5) +
+  scale_fill_distiller(palette ="Spectral",limits = c(0, 1), direction = 1)
+
+filter(sweep_mod_inf, effect == "fixed", term == "modified_effect:informative_effect") %>%
+  group_by(b_mod_inf, subj_n) %>%
+  summarise(power = mean(p.value < .05), .groups = "drop") %>%
+  ggplot(aes(b_mod_inf, subj_n, fill = power)) +
+  geom_tile() + geom_text(aes(label = sprintf("%.2f", power)), color = "white", size = 5) +
+  scale_fill_distiller(palette ="Spectral",limits = c(0, 1), direction = 1)
+
+filter(sweep_mod_inf_ment, effect == "fixed", term == "modified_effect:informative_effect:mention_effect") %>%
+  group_by(b_mod_inf_ment, subj_n) %>%
+  summarise(power = mean(p.value < .05), .groups = "drop") %>%
+  ggplot(aes(b_mod_inf_ment, subj_n, fill = power)) +
+  geom_tile() + geom_text(aes(label = sprintf("%.2f", power)), color = "white", size = 5) +
+  scale_fill_distiller(palette ="Spectral",limits = c(0, 1), direction = 1)
+```
+Based on these findings we set up new expected effect sizes and vary the number of participants. 
+```{r}
+n_reps <- 20
+sweep_power <- crossing(
+  rep = 1:n_reps, subj_n = c(40, 48, 56, 64, 72, 80), item_n = 24,
+  b_inf_ment = 1.5, r01i = 0.5, 
+  b_mod = -1.5,
+  b_inf = 1.0,
+  b_ment = -1.0,
+  b_mod_inf = -1.5,
+  b_mod_ment = -2.5,
+  b_mod_inf_ment = 2.0
+) %>%
+  mutate(analysis = pmap(., simulate_n400)) %>%
+  unnest(analysis)
+
+filter(sweep_power, effect == "fixed", term == "mention_effect") %>%
+  group_by(b_ment, subj_n) %>%
+  summarise(power = mean(p.value < .05), .groups = "drop") %>%
+  ggplot(aes(b_ment, subj_n, fill = power)) +
+  geom_tile() +
+  geom_text(aes(label = sprintf("%.2f", power)), color = "white", size = 5) +
+  scale_fill_distiller(palette ="Spectral",limits = c(0, 1), direction = 1)
+
+filter(sweep_power, effect == "fixed", term == "informative_effect") %>%
+  group_by(b_inf, subj_n) %>%
+  summarise(power = mean(p.value < .05), .groups = "drop") %>%
+  ggplot(aes(b_inf, subj_n, fill = power)) +
+  geom_tile() + geom_text(aes(label = sprintf("%.2f", power)), color = "white", size = 5) +
+  scale_fill_distiller(palette ="Spectral",limits = c(0, 1), direction = 1)
+
+filter(sweep_power, effect == "fixed", term == "modified_effect") %>%
+  group_by(b_mod, subj_n) %>%
+  summarise(power = mean(p.value < .05), .groups = "drop") %>%
+  ggplot(aes(b_mod, subj_n, fill = power)) +
+  geom_tile() + geom_text(aes(label = sprintf("%.2f", power)), color = "white", size = 5) + 
+  scale_fill_distiller(palette ="Spectral",limits = c(0, 1), direction = 1)
+
+filter(sweep_power, effect == "fixed", term == "informative_effect:mention_effect") %>%
+  group_by(b_inf_ment, subj_n) %>%
+  summarise(power = mean(p.value < .05), .groups = "drop") %>%
+  ggplot(aes(b_inf_ment, subj_n, fill = power)) +
+  geom_tile() + geom_text(aes(label = sprintf("%.2f", power)), color = "white", size = 5) +
+  scale_fill_distiller(palette ="Spectral",limits = c(0, 1), direction = 1)
+
+filter(sweep_power, effect == "fixed", term == "modified_effect:informative_effect") %>%
+  group_by(b_mod_inf, subj_n) %>%
+  summarise(power = mean(p.value < .05), .groups = "drop") %>%
+  ggplot(aes(b_mod_inf, subj_n, fill = power)) +
+  geom_tile() + geom_text(aes(label = sprintf("%.2f", power)), color = "white", size = 5) +
+  scale_fill_distiller(palette ="Spectral",limits = c(0, 1), direction = 1)
+
+filter(sweep_power, effect == "fixed", term == "modified_effect:mention_effect") %>%
+  group_by(b_mod_ment, subj_n) %>%
+  summarise(power = mean(p.value < .05), .groups = "drop") %>%
+  ggplot(aes(b_mod_ment, subj_n, fill = power)) +
+  geom_tile() + geom_text(aes(label = sprintf("%.2f", power)), color = "white", size = 5) +
+  scale_fill_distiller(palette ="Spectral",limits = c(0, 1), direction = 1)
+
+filter(sweep_power, effect == "fixed", term == "modified_effect:informative_effect:mention_effect") %>%
+  group_by(b_mod_inf_ment, subj_n) %>%
+  summarise(power = mean(p.value < .05), .groups = "drop") %>%
+  ggplot(aes(b_mod_inf_ment, subj_n, fill = power)) +
+  geom_tile() + geom_text(aes(label = sprintf("%.2f", power)), color = "white", size = 5) +
+  scale_fill_distiller(palette ="Spectral",limits = c(0, 1), direction = 1)
+```
+This suggests that having at least 40 participants should allow me to reliably detect main effects and two-way interactions. To reliably detect the three-way interaction with 80% power around 72 are needed. With 64, we can reach 0.73 power. With the intended 48 participants we are likely to only achieve 0.54 power. 
+
+# Noun:P600
+```{r}
+simulate_p600 <- function(rep = NULL, subj_n, item_n,
+                           b_mod, b_inf, b_ment,
+                           b_mod_inf, b_mod_ment,
+                           b_inf_ment, b_mod_inf_ment,
+                           u0i = 1.3, u_info_i = 0.06,
+                           u0s = 0.8, u_info_s = 1.7,
+                           r01i = -0.5, sigma_val = 8.3, ...) {
+
+  dat <- build_design(n_items = item_n, n_subj = subj_n) %>%
+    mutate(
+      modified_effect     = if_else(modified == "unmod", -0.5, 0.5),
+      informative_effect  = if_else(informative == "uninf", -0.5, 0.5),
+      mention_effect       = if_else(mention == "m2", -0.5, 0.5)
+    ) %>%
+    add_ranef("item", u0i = u0i ) %>% # u_info_i = u_info_i, .cors = r01i
+    add_ranef("subj", u0s = u0s) %>% #  u_info_s = u_info_s, .cors = r01i
+    add_ranef(sigma = sigma_val) %>%
+    mutate(
+      P600 = 0.4 +
+        b_mod * modified_effect +
+        b_inf * informative_effect +
+      #  (b_inf + u_info_s + u_info_i) * informative_effect +
+        b_ment  * mention_effect +
+        b_mod_inf      * modified_effect    * informative_effect +
+        b_mod_ment     * modified_effect    * mention_effect +
+        b_inf_ment     * informative_effect * mention_effect +
+        b_mod_inf_ment * modified_effect * informative_effect * mention_effect +
+        u0s + u0i + sigma
+    )
+
+  mod <- lmer(P600 ~ modified_effect * informative_effect * mention_effect +
+                (1  | subj) +
+                (1  | item),
+              data = dat)
+
+  broom.mixed::tidy(mod)
+}
+```
+
+```{r}
+#|echo: false
+n_reps <- 200
+
+sim_results <- map_dfr(1:n_reps, function(i) {
+  simulate_p600(subj_n = 48, item_n = 24,
+                           b_mod = 0.4, b_inf = -0.2, b_ment = 0.05,
+                           b_mod_inf = 1.0, b_mod_ment = 1.6,
+                           b_inf_ment = 1.0 , b_mod_inf_ment = 1.89)
+}, .id = "rep")
+
+power_table <- sim_results %>%
+  filter(effect == "fixed") %>%
+  group_by(term) %>%
+  summarise(
+    power       = mean(p.value < .05),
+    n_converged = n_distinct(rep),
+    mean_est    = mean(estimate),
+    .groups = "drop"
+  )
+
+power_table
+```
+With this data set none of the effects reach sufficient power but the interaction effect between modification and mention 0.885.  
+
+## Based on the pilot data check power for different set sizes and expected effect sizes 
+We always manipulate one effect keeping the other values constant.
+```{r}
+#| echo: false
+n_reps <- 20
+
+sweep_mod <- crossing(
+  rep = 1:n_reps, subj_n = c(48, 56, 64, 72), item_n = 24,
+  b_mod = c(-0.2, 0.1, 0.4, 0.7, 1.0), r01i = -0.5,  # we make 0.3 steps in both directions
+  b_inf = -0.2,
+  b_ment = 0.05,
+  b_mod_inf = 1.0, 
+  b_mod_ment = 1.6,
+  b_inf_ment = 1.0,
+  b_mod_inf_ment = 1.88
+) %>%
+  mutate(analysis = pmap(., simulate_P600)) %>%
+  unnest(analysis)
+
+sweep_inf <- crossing(
+  rep = 1:n_reps, subj_n = c(48, 56, 64, 72), item_n = 24,
+  b_inf = c(-0.8, -0.5, -0.2, 0.1, 0.4), r01i = -0.5, 
+  b_mod = 0.4,
+  b_ment = 0.05,
+  b_mod_inf = 1.0,
+  b_mod_ment = 1.6,
+  b_inf_ment = 1.0,
+  b_mod_inf_ment = 1.88
+) %>%
+  mutate(analysis = pmap(., simulate_P600)) %>%
+  unnest(analysis)
+
+sweep_ment <- crossing(
+  rep = 1:n_reps, subj_n = c(48, 56, 64, 72), item_n = 24,
+  b_ment = c(-0.65, -0.35, 0.05, 0.35, 0.65), r01i = -0.5, 
+  b_mod = 0.4,
+  b_inf = -0.2,
+  b_mod_inf = 1.0,
+  b_mod_ment = 1.6,
+  b_inf_ment = 1.0,
+  b_mod_inf_ment = 1.88
+) %>%
+  mutate(analysis = pmap(., simulate_P600)) %>%
+  unnest(analysis)
+
+sweep_inf_ment <- crossing(
+  rep = 1:n_reps, subj_n = c(48, 56, 64, 72), item_n = 24,
+  b_inf_ment = c(0.4, 0.7, 1.0, 1.3, 1.6), r01i = -0.5, 
+  b_mod = 0.4,
+  b_inf = -0.2,
+  b_ment = 0.05,
+  b_mod_inf = 1.0, 
+  b_mod_ment = 1.6,
+  b_mod_inf_ment = 1.88
+) %>%
+  mutate(analysis = pmap(., simulate_P600)) %>%
+  unnest(analysis)
+
+sweep_mod_inf <- crossing(
+  rep = 1:n_reps, subj_n = c(48, 56, 64, 72), item_n = 24,
+  b_inf_ment = 1.0, r01i = -0.5, 
+  b_mod = 0.4,
+  b_inf = -0.2,
+  b_ment = -0.05,
+  b_mod_inf = c(0.4, 0.7, 1.0, 1.3, 1.6),
+  b_mod_ment = 1.6,
+  b_mod_inf_ment = 1.88
+) %>%
+  mutate(analysis = pmap(., simulate_P600)) %>%
+  unnest(analysis)
+
+sweep_mod_ment <- crossing(
+  rep = 1:n_reps, subj_n = c(48, 56, 64, 72), item_n = 24,
+  b_inf_ment = 1.0, r01i = -0.5, 
+  b_mod = 0.4,
+  b_inf = -0.2,
+  b_ment = 0.05,
+  b_mod_inf = 1.0,
+  b_mod_ment = c(1.0, 1.3, 1.6, 1.9, 2.2),
+  b_mod_inf_ment = 1.88
+) %>%
+  mutate(analysis = pmap(., simulate_P600)) %>%
+  unnest(analysis)
+
+sweep_mod_inf_ment <- crossing(
+  rep = 1:n_reps, subj_n = c(48, 56, 64, 72), item_n = 24,
+  b_inf_ment = 1.0, r01i = -0.5, 
+  b_mod = 0.4,
+  b_inf = -0.2,
+  b_ment = 0.05,
+  b_mod_inf = 1.0,
+  b_mod_ment = 1.6,
+  b_mod_inf_ment = c(1.28, 1.58, 1.88, 2.18, 2.48)
+) %>%
+  mutate(analysis = pmap(., simulate_P600)) %>%
+  unnest(analysis)
+```
+
+
+```{r}
+filter(sweep_ment, effect == "fixed", term == "mention_effect") %>%
+  group_by(b_ment, subj_n) %>%
+  summarise(power = mean(p.value < .05), .groups = "drop") %>%
+  ggplot(aes(b_ment, subj_n, fill = power)) +
+  geom_tile() +
+  geom_text(aes(label = sprintf("%.2f", power)), color = "white", size = 10) +
+  scale_fill_distiller(palette ="Spectral",limits = c(0, 1), direction = 1)
+
+filter(sweep_inf, effect == "fixed", term == "informative_effect") %>%
+  group_by(b_inf, subj_n) %>%
+  summarise(power = mean(p.value < .05), .groups = "drop") %>%
+  ggplot(aes(b_inf, subj_n, fill = power)) +
+  geom_tile() + geom_text(aes(label = sprintf("%.2f", power)), color = "white", size = 10) +
+  scale_fill_distiller(palette ="Spectral",limits = c(0, 1), direction = 1)
+
+filter(sweep_mod, effect == "fixed", term == "modified_effect") %>%
+  group_by(b_mod, subj_n) %>%
+  summarise(power = mean(p.value < .05), .groups = "drop") %>%
+  ggplot(aes(b_mod, subj_n, fill = power)) +
+  geom_tile() + geom_text(aes(label = sprintf("%.2f", power)), color = "white", size = 10) +
+  scale_fill_distiller(palette ="Spectral",limits = c(0, 1), direction = 1)
+
+filter(sweep_inf_ment, effect == "fixed", term == "informative_effect:mention_effect") %>%
+  group_by(b_inf_ment, subj_n) %>%
+  summarise(power = mean(p.value < .05), .groups = "drop") %>%
+  ggplot(aes(b_inf_ment, subj_n, fill = power)) +
+  geom_tile() + geom_text(aes(label = sprintf("%.2f", power)), color = "white", size = 10) +
+  scale_fill_distiller(palette ="Spectral",limits = c(0, 1), direction = 1)
+
+filter(sweep_mod_inf, effect == "fixed", term == "modified_effect:informative_effect") %>%
+  group_by(b_mod_inf, subj_n) %>%
+  summarise(power = mean(p.value < .05), .groups = "drop") %>%
+  ggplot(aes(b_mod_inf, subj_n, fill = power)) +
+  geom_tile() + geom_text(aes(label = sprintf("%.2f", power)), color = "white", size = 10) +
+  scale_fill_distiller(palette ="Spectral",limits = c(0, 1), direction = 1)
+
+filter(sweep_mod_ment, effect == "fixed", term == "modified_effect:mention_effect") %>%
+  group_by(b_mod_ment, subj_n) %>%
+  summarise(power = mean(p.value < .05), .groups = "drop") %>%
+  ggplot(aes(b_mod_ment, subj_n, fill = power)) +
+  geom_tile() + geom_text(aes(label = sprintf("%.2f", power)), color = "white", size = 10) +
+  scale_fill_distiller(palette ="Spectral",limits = c(0, 1), direction = 1)
+
+filter(sweep_mod_inf_ment, effect == "fixed", term == "modified_effect:informative_effect:mention_effect") %>%
+  group_by(b_mod_inf_ment, subj_n) %>%
+  summarise(power = mean(p.value < .05), .groups = "drop") %>%
+  ggplot(aes(b_mod_inf_ment, subj_n, fill = power)) +
+  geom_tile() + geom_text(aes(label = sprintf("%.2f", power)), color = "white", size = 10) +
+  scale_fill_distiller(palette ="Spectral",limits = c(0, 1), direction = 1)
+```
+Again drawing conclusions for the main effects, fit one version with preferred values and so on.
+
+# Adjective
+Run the same for adjectives. 
+
+# Determiner 
+Run the same for determiners. 
